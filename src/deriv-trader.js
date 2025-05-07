@@ -1,22 +1,19 @@
-const { DerivAPI } = require('./deriv-api');
-require('dotenv').config();
+/**
+ * Deriv Trader Bot - Main trading module
+ * 
+ * Automated trading bot for Deriv.com that implements an odd/even digit pattern strategy 
+ * with Martingale progression.
+ */
 
-// Configuration
-const CONFIG = {
-    ALLOWED_SYMBOLS: ['1HZ10V', 'R_10', '1HZ25V', 'R_25', '1HZ50V', 'R_50', '1HZ75V', 'R_75', '1HZ100V', 'R_100', 'RDBEAR', 'RDBULL'],
-    MARTINGALE_MULTIPLIERS: [0.35, 0.69, 1.39, 2.84, 5.8, 11.52, 23.51, 47.98],
-    MAX_CONSECUTIVE_DIGITS: 3, // Number of consecutive odd/even digits to trigger a trade
-    DEFAULT_SYMBOL: 'R_100',
-    CURRENCY: 'USD',
-    CONTRACT_DURATION: 1,
-    CONTRACT_DURATION_UNIT: 't', // tick
-};
+const { DerivAPI } = require('./deriv-api');
+const config = require('./utils/config');
+const logger = require('./utils/logger');
 
 class DerivTrader {
     constructor() {
         this.api = new DerivAPI();
-        this.symbol = process.argv[2]?.toUpperCase() || CONFIG.DEFAULT_SYMBOL;
-        this.maxTicks = parseInt(process.argv[3]) || CONFIG.MAX_CONSECUTIVE_DIGITS;
+        this.symbol = config.get('DEFAULT_SYMBOL');
+        this.maxTicks = config.get('MAX_CONSECUTIVE_DIGITS');
         
         // Trading state
         this.consecutiveOdd = 0;
@@ -56,14 +53,14 @@ class DerivTrader {
             this.setupShutdownHandlers();
             
         } catch (error) {
-            console.error('\x1b[31mInitialization Error:\x1b[0m', error.message || error);
+            logger.critical('Initialization Error:', error.message || error);
             process.exit(1);
         }
     }
     
     validateInputs() {
-        if (!CONFIG.ALLOWED_SYMBOLS.includes(this.symbol)) {
-            throw new Error(`Symbol ${this.symbol} is not allowed. Valid symbols: ${CONFIG.ALLOWED_SYMBOLS.join(', ')}`);
+        if (!config.get('ALLOWED_SYMBOLS').includes(this.symbol)) {
+            throw new Error(`Symbol ${this.symbol} is not allowed. Valid symbols: ${config.get('ALLOWED_SYMBOLS').join(', ')}`);
         }
         
         if (isNaN(this.maxTicks) || this.maxTicks <= 0) {
@@ -72,21 +69,24 @@ class DerivTrader {
     }
     
     displayWelcomeMessage(authData) {
-        const welcomeMessage = `
-*****************************************************************
-*                   WELCOME TO DERIV TRADER                      *
-*****************************************************************
-\x1b[36mSYMBOL:\x1b[0m ${this.symbol}
-\x1b[36mStrategy:\x1b[0m ODD/EVEN > ${this.maxTicks} consecutive digits
-\x1b[36mDATE:\x1b[0m ${new Date().toLocaleString()}
-\x1b[36mACCOUNT:\x1b[0m ${authData.authorize.loginid}
-\x1b[36mINITIAL BALANCE:\x1b[0m ${authData.authorize.balance} ${authData.authorize.currency}
-`;
-        console.log(welcomeMessage);
+        logger.divider('*', 65);
+        logger.info('                   WELCOME TO DERIV TRADER                      ');
+        logger.divider('*', 65);
+        logger.info(`SYMBOL: ${this.symbol}`);
+        logger.info(`Strategy: ODD/EVEN > ${this.maxTicks} consecutive digits`);
+        logger.info(`DATE: ${new Date().toLocaleString()}`);
+        logger.info(`ACCOUNT: ${authData.authorize.loginid}`);
+        logger.info(`INITIAL BALANCE: ${authData.authorize.balance} ${authData.authorize.currency}`);
+        logger.divider('-', 65);
+
+        // Display configuration if in debug mode
+        if (config.get('LOG_LEVEL') === 'DEBUG') {
+            config.displayConfig();
+        }
     }
     
     async startTrading() {
-        console.log('\x1b[33mStarting trade monitoring...\x1b[0m\n');
+        logger.info('Starting trade monitoring...\n');
         await this.subscribeToTicks();
     }
     
@@ -98,7 +98,7 @@ class DerivTrader {
             });
             
             this.tickSubscriptionId = tickResponse.subscription.id;
-            console.log(`\x1b[36mSubscribed to ${this.symbol} tick stream\x1b[0m`);
+            logger.success(`Subscribed to ${this.symbol} tick stream`);
             
             // Set up the event handler for incoming ticks
             this.api.socket.addEventListener('message', (event) => {
@@ -112,7 +112,7 @@ class DerivTrader {
             });
             
         } catch (error) {
-            console.error('\x1b[31mError subscribing to ticks:\x1b[0m', error.message || error);
+            logger.error('Error subscribing to ticks:', error.message || error);
             throw error;
         }
     }
@@ -129,11 +129,11 @@ class DerivTrader {
         if (isEven) {
             this.consecutiveEven++;
             this.consecutiveOdd = 0;
-            console.log(`\x1b[90mTick: ${tick.quote} (${lastDigit}) - Even (${this.consecutiveEven}/${this.maxTicks})\x1b[0m`);
+            logger.debug(`Tick: ${tick.quote} (${lastDigit}) - Even (${this.consecutiveEven}/${this.maxTicks})`);
         } else {
             this.consecutiveOdd++;
             this.consecutiveEven = 0;
-            console.log(`\x1b[90mTick: ${tick.quote} (${lastDigit}) - Odd (${this.consecutiveOdd}/${this.maxTicks})\x1b[0m`);
+            logger.debug(`Tick: ${tick.quote} (${lastDigit}) - Odd (${this.consecutiveOdd}/${this.maxTicks})`);
         }
         
         // Check if we should place a trade
@@ -157,27 +157,41 @@ class DerivTrader {
             this.currentContractType = contractType;
             
             // Check if we've hit max consecutive losses
-            if (this.lossCount >= CONFIG.MARTINGALE_MULTIPLIERS.length) {
-                console.log('\x1b[31mReached maximum consecutive losses. Resetting strategy.\x1b[0m');
+            const martingaleMultipliers = config.get('MARTINGALE_MULTIPLIERS');
+            if (this.lossCount >= martingaleMultipliers.length) {
+                logger.warning('Reached maximum consecutive losses. Resetting strategy.');
                 this.resetStrategy();
                 return;
             }
             
             // Determine stake amount using Martingale strategy
-            const stake = CONFIG.MARTINGALE_MULTIPLIERS[this.lossCount];
+            const stake = martingaleMultipliers[this.lossCount];
             
-            console.log(`\x1b[33mPlacing ${contractType} trade with stake ${stake} ${CONFIG.CURRENCY}\x1b[0m`);
+            // Check if trading is enabled (for simulation mode)
+            if (!config.get('TRADING_ENABLED')) {
+                logger.trade(`[SIMULATION] Would place ${contractType} trade with stake ${stake} ${config.get('CURRENCY')}`);
+                // Simulate a random win/loss outcome in simulation mode
+                setTimeout(() => {
+                    const randomOutcome = Math.random() > 0.5;
+                    this.simulateTradeOutcome(randomOutcome, stake);
+                }, 2000);
+                return;
+            }
+            
+            // Log the trade we're about to place
+            logger.tradeStart(contractType, stake, this.symbol);
             
             // Buy contract
             const contractResponse = await this.api.send({
                 buy: 1,
+                price: stake,
                 parameters: {
                     amount: stake,
                     basis: 'stake',
                     contract_type: contractType,
-                    currency: CONFIG.CURRENCY,
-                    duration: CONFIG.CONTRACT_DURATION,
-                    duration_unit: CONFIG.CONTRACT_DURATION_UNIT,
+                    currency: config.get('CURRENCY'),
+                    duration: config.get('CONTRACT_DURATION'),
+                    duration_unit: config.get('CONTRACT_DURATION_UNIT'),
                     symbol: this.symbol
                 }
             });
@@ -197,9 +211,34 @@ class DerivTrader {
             });
             
         } catch (error) {
-            console.error('\x1b[31mError placing trade:\x1b[0m', error.message || error);
+            logger.error('Error placing trade:', error.message || error);
             this.resetStrategy();
         }
+    }
+    
+    // Simulate a trade outcome (for simulation mode)
+    simulateTradeOutcome(isWin, stake) {
+        const profit = isWin ? stake * 0.95 : -stake; // Assume 95% payout
+        
+        // Update statistics
+        this.stats.totalTrades++;
+        this.stats.currentBalance += profit;
+        this.stats.profit += profit;
+        
+        if (isWin) {
+            this.stats.wonTrades++;
+            logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+            this.resetStrategy();
+        } else {
+            this.stats.lostTrades++;
+            logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
+            this.lossCount++;
+            this.prepareNextTrade();
+        }
+        
+        // Display updated statistics
+        this.displayTradeStats();
+        this.ignoreTicks = false;
     }
     
     processContractUpdate(contract) {
@@ -218,11 +257,11 @@ class DerivTrader {
             
             if (isWin) {
                 this.stats.wonTrades++;
-                console.log(`\x1b[32mTrade WON: ${this.currentContractType} +${profit.toFixed(2)} ${CONFIG.CURRENCY}\x1b[0m`);
+                logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
                 this.resetStrategy();
             } else {
                 this.stats.lostTrades++;
-                console.log(`\x1b[31mTrade LOST: ${this.currentContractType} ${profit.toFixed(2)} ${CONFIG.CURRENCY}\x1b[0m`);
+                logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
                 this.lossCount++;
                 this.prepareNextTrade();
             }
@@ -230,12 +269,33 @@ class DerivTrader {
             // Display updated statistics
             this.displayTradeStats();
             
+            // Check max loss limit if configured
+            this.checkSafetyLimits();
+            
             // Unsubscribe from this contract
             this.api.send({
                 forget: contract.id
             });
             
             this.activeContractId = null;
+        }
+    }
+    
+    checkSafetyLimits() {
+        // Check maximum consecutive losses
+        const maxConsecutiveLosses = config.get('MAX_CONSECUTIVE_LOSSES');
+        if (maxConsecutiveLosses && this.lossCount >= maxConsecutiveLosses) {
+            logger.critical(`Safety limit reached: ${this.lossCount} consecutive losses`);
+            this.shutdown();
+            return;
+        }
+        
+        // Check maximum daily loss
+        const maxDailyLoss = config.get('MAX_DAILY_LOSS');
+        if (maxDailyLoss && this.stats.profit <= -maxDailyLoss) {
+            logger.critical(`Safety limit reached: Maximum daily loss of ${maxDailyLoss} exceeded`);
+            this.shutdown();
+            return;
         }
     }
     
@@ -256,15 +316,21 @@ class DerivTrader {
     }
     
     displayTradeStats() {
-        const stats = `
-\x1b[36mTRADING STATISTICS:\x1b[0m
-Total Trades: ${this.stats.totalTrades}
-Won: ${this.stats.wonTrades} (${this.stats.totalTrades > 0 ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) : 0}%)
-Lost: ${this.stats.lostTrades}
-Current Balance: ${this.stats.currentBalance.toFixed(2)} ${CONFIG.CURRENCY}
-Profit/Loss: ${this.stats.profit >= 0 ? '\x1b[32m+' : '\x1b[31m'}${this.stats.profit.toFixed(2)}\x1b[0m ${CONFIG.CURRENCY}
-`;
-        console.log(stats);
+        const winRate = this.stats.totalTrades > 0 
+            ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) 
+            : 0;
+            
+        // Create statistics object
+        const statistics = {
+            'Total Trades': this.stats.totalTrades,
+            'Won': `${this.stats.wonTrades} (${winRate}%)`,
+            'Lost': this.stats.lostTrades,
+            'Current Balance': `${this.stats.currentBalance.toFixed(2)} ${config.get('CURRENCY')}`,
+            'Profit/Loss': `${this.stats.profit >= 0 ? '+' : ''}${this.stats.profit.toFixed(2)} ${config.get('CURRENCY')}`
+        };
+        
+        // Log the statistics using the logger's stats method
+        logger.stats(statistics);
     }
     
     setupShutdownHandlers() {
@@ -273,13 +339,13 @@ Profit/Loss: ${this.stats.profit >= 0 ? '\x1b[32m+' : '\x1b[31m'}${this.stats.pr
         });
         
         process.on('uncaughtException', async (error) => {
-            console.error('\x1b[31mUncaught Exception:\x1b[0m', error);
+            logger.critical('Uncaught Exception:', error);
             await this.shutdown();
         });
     }
     
     async shutdown() {
-        console.log('\n\x1b[33mShutting down trading bot...\x1b[0m');
+        logger.info('\nShutting down trading bot...');
         
         // Display final statistics
         if (this.tickSubscriptionId) {
@@ -287,9 +353,9 @@ Profit/Loss: ${this.stats.profit >= 0 ? '\x1b[32m+' : '\x1b[31m'}${this.stats.pr
                 await this.api.send({
                     forget: this.tickSubscriptionId
                 });
-                console.log('Unsubscribed from tick stream');
+                logger.info('Unsubscribed from tick stream');
             } catch (error) {
-                console.error('Error unsubscribing from ticks:', error.message);
+                logger.error('Error unsubscribing from ticks:', error.message);
             }
         }
         
@@ -303,36 +369,24 @@ Profit/Loss: ${this.stats.profit >= 0 ? '\x1b[32m+' : '\x1b[31m'}${this.stats.pr
             const finalBalance = parseFloat(balanceResponse.balance.balance);
             const totalProfit = finalBalance - this.stats.initialBalance;
             
-            console.log(`
-\x1b[36mFINAL TRADING SUMMARY:\x1b[0m
-Initial Balance: ${this.stats.initialBalance.toFixed(2)} ${CONFIG.CURRENCY}
-Final Balance: ${finalBalance.toFixed(2)} ${CONFIG.CURRENCY}
-Total Profit/Loss: ${totalProfit >= 0 ? '\x1b[32m+' : '\x1b[31m'}${totalProfit.toFixed(2)}\x1b[0m ${CONFIG.CURRENCY}
-Total Trades: ${this.stats.totalTrades}
-Win Rate: ${this.stats.totalTrades > 0 ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) : 0}%
-`);
+            logger.divider('=', 65);
+            logger.info('FINAL TRADING SUMMARY:');
+            logger.info(`Initial Balance: ${this.stats.initialBalance.toFixed(2)} ${config.get('CURRENCY')}`);
+            logger.info(`Final Balance: ${finalBalance.toFixed(2)} ${config.get('CURRENCY')}`);
+            logger.info(`Total Profit/Loss: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} ${config.get('CURRENCY')}`);
+            logger.info(`Total Trades: ${this.stats.totalTrades}`);
+            logger.info(`Win Rate: ${this.stats.totalTrades > 0 ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) : 0}%`);
+            logger.divider('=', 65);
         } catch (error) {
-            console.error('Error getting final balance:', error.message);
+            logger.error('Error getting final balance:', error.message);
         }
         
         // Disconnect from API
         this.api.disconnect();
-        console.log('Disconnected from Deriv API');
+        logger.info('Disconnected from Deriv API');
         
         process.exit(0);
     }
-}
-
-// Create a .env file configuration for API credentials
-const dotenvExample = `# Deriv API Credentials
-APP_ID=74555
-API_TOKEN=ZBsf8h8dXBU4h31
-`;
-
-const fs = require('fs');
-if (!fs.existsSync('.env')) {
-    fs.writeFileSync('.env', dotenvExample);
-    console.log('Created .env file with default credentials. Please update with your own credentials.');
 }
 
 // Start the trader

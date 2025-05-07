@@ -1,10 +1,13 @@
-const WebSocket = require('ws');
-require('dotenv').config();
+/**
+ * DerivAPI - WebSocket API wrapper for Deriv.com
+ * 
+ * Handles secure WebSocket connections, authentication, and message handling
+ * with the Deriv API.
+ */
 
-// Load API credentials from environment variables
-const API_URL = 'wss://ws.derivws.com/websockets/v3';
-const APP_ID = process.env.APP_ID || '74555';
-const API_TOKEN = process.env.API_TOKEN || 'ZBsf8h8dXBU4h31';
+const WebSocket = require('ws');
+const config = require('./utils/config');
+const logger = require('./utils/logger');
 
 class DerivAPI {
     constructor() {
@@ -14,7 +17,7 @@ class DerivAPI {
         this.messageHandlers = new Map();
         this.reqId = 1;
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 5;
+        this.maxReconnectAttempts = config.get('MAX_RECONNECT_ATTEMPTS');
         this.reconnectTimeout = null;
     }
 
@@ -22,17 +25,20 @@ class DerivAPI {
     connect() {
         return new Promise((resolve, reject) => {
             try {
-                this.socket = new WebSocket(`${API_URL}?app_id=${APP_ID}`);
+                const apiUrl = config.get('API_URL');
+                const appId = config.get('APP_ID');
+                
+                this.socket = new WebSocket(`${apiUrl}?app_id=${appId}`);
                 
                 this.socket.onopen = () => {
-                    console.log('\x1b[36mConnection established with Deriv API\x1b[0m');
+                    logger.success('Connection established with Deriv API');
                     this.connected = true;
                     this.reconnectAttempts = 0;
                     resolve();
                 };
                 
                 this.socket.onclose = (event) => {
-                    console.log(`\x1b[33mConnection closed: ${event.reason || 'Unknown reason'}\x1b[0m`);
+                    logger.warning(`Connection closed: ${event.reason || 'Unknown reason'}`);
                     this.connected = false;
                     this.authorized = false;
                     
@@ -43,7 +49,7 @@ class DerivAPI {
                 };
                 
                 this.socket.onerror = (error) => {
-                    console.error('\x1b[31mWebSocket error:\x1b[0m', error);
+                    logger.error('WebSocket error:', error);
                     if (!this.connected) {
                         reject(new Error('Failed to connect to Deriv API'));
                     }
@@ -53,9 +59,17 @@ class DerivAPI {
                     try {
                         const data = JSON.parse(message.data);
                         
+                        // Log detailed API responses in debug mode
+                        if (config.get('LOG_LEVEL') === 'DEBUG') {
+                            logger.debug(`API Response (${data.msg_type}):`);
+                            if (data.msg_type !== 'tick') { // Don't log every tick in detail
+                                logger.logObject('DEBUG', 'Data', data);
+                            }
+                        }
+                        
                         // Check for errors
                         if (data.error) {
-                            console.error('\x1b[31mAPI Error:\x1b[0m', data.error.message);
+                            logger.error('API Error:', data.error.message);
                             
                             // For handlers waiting for this specific response
                             const handler = this.messageHandlers.get(data.req_id);
@@ -69,9 +83,9 @@ class DerivAPI {
                         // Handle authorization response
                         if (data.msg_type === 'authorize') {
                             this.authorized = true;
-                            console.log('\x1b[36mSuccessfully authorized with Deriv API\x1b[0m');
-                            console.log(`\x1b[36mAccount ID:\x1b[0m ${data.authorize.loginid}`);
-                            console.log(`\x1b[36mBalance:\x1b[0m ${data.authorize.balance} ${data.authorize.currency}`);
+                            logger.success('Successfully authorized with Deriv API');
+                            logger.info(`Account ID: ${data.authorize.loginid}`);
+                            logger.info(`Balance: ${data.authorize.balance} ${data.authorize.currency}`);
                         }
                         
                         // Call the handler associated with this request ID
@@ -81,11 +95,11 @@ class DerivAPI {
                             this.messageHandlers.delete(data.req_id);
                         }
                     } catch (error) {
-                        console.error('\x1b[31mError processing WebSocket message:\x1b[0m', error);
+                        logger.error('Error processing WebSocket message:', error);
                     }
                 };
             } catch (error) {
-                console.error('\x1b[31mError creating WebSocket connection:\x1b[0m', error);
+                logger.error('Error creating WebSocket connection:', error);
                 reject(error);
             }
         });
@@ -95,7 +109,7 @@ class DerivAPI {
         this.reconnectAttempts++;
         const delay = Math.min(30000, Math.pow(2, this.reconnectAttempts) * 1000); // Exponential backoff
         
-        console.log(`\x1b[33mAttempting to reconnect in ${delay/1000} seconds (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...\x1b[0m`);
+        logger.warning(`Attempting to reconnect in ${delay/1000} seconds (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
         
         clearTimeout(this.reconnectTimeout);
         this.reconnectTimeout = setTimeout(async () => {
@@ -105,7 +119,7 @@ class DerivAPI {
                     await this.authorize();
                 }
             } catch (error) {
-                console.error('\x1b[31mReconnection failed:\x1b[0m', error.message);
+                logger.error('Reconnection failed:', error.message);
             }
         }, delay);
     }
@@ -116,8 +130,10 @@ class DerivAPI {
             return Promise.reject(new Error('Not connected to Deriv API'));
         }
         
+        const apiToken = config.get('API_TOKEN');
+        
         return this.send({
-            authorize: API_TOKEN
+            authorize: apiToken
         });
     }
     
@@ -130,6 +146,15 @@ class DerivAPI {
         const req_id = this.reqId++;
         request.req_id = req_id;
         
+        if (config.get('LOG_LEVEL') === 'DEBUG') {
+            // For sensitive requests, mask the token in logs
+            const logRequest = { ...request };
+            if (logRequest.authorize) {
+                logRequest.authorize = '********';
+            }
+            logger.debug(`API Request: ${JSON.stringify(logRequest)}`);
+        }
+        
         return new Promise((resolve, reject) => {
             try {
                 this.messageHandlers.set(req_id, { resolve, reject });
@@ -139,9 +164,9 @@ class DerivAPI {
                 setTimeout(() => {
                     if (this.messageHandlers.has(req_id)) {
                         this.messageHandlers.delete(req_id);
-                        reject(new Error(`Request ${req_id} timed out after 30 seconds`));
+                        reject(new Error(`Request ${req_id} timed out after ${config.get('MESSAGE_TIMEOUT')/1000} seconds`));
                     }
-                }, 30000);
+                }, config.get('MESSAGE_TIMEOUT'));
             } catch (error) {
                 this.messageHandlers.delete(req_id);
                 reject(error);
@@ -155,7 +180,7 @@ class DerivAPI {
         
         if (this.socket && this.connected) {
             this.socket.close();
-            console.log('\x1b[36mDisconnected from Deriv API\x1b[0m');
+            logger.info('Disconnected from Deriv API');
         }
     }
     
