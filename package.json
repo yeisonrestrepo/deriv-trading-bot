@@ -1,0 +1,14 @@
+{
+  "name": "oddeventrader",
+  "version": "1.0.0",
+  "description": "Bot to trade in Deriv",
+  "main": "trader-bot.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "yeison.restrepo.r@gmail.com",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.18.2"
+  }
+}
