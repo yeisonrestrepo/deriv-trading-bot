@@ -26,7 +26,8 @@ class DerivTrader {
         this.currentContractType = null;
         this.nextTradeReady = false;
         this.predictionMade = false;
-        
+        this.pendingContractType = null; // Add this to track the next trade to place
+                
         // Statistics
         this.stats = {
             totalTrades: 0,
@@ -36,6 +37,7 @@ class DerivTrader {
             currentBalance: 0,
             profit: 0
         };
+
     }
 
     async initialize() {
@@ -45,8 +47,12 @@ class DerivTrader {
             
             // Authorize and get account info
             const authResponse = await this.api.authorize();
-            this.stats.initialBalance = parseFloat(authResponse.authorize.balance);
+            console.log(authResponse.authorize.balance);
+            this.stats.initialBalance = parseFloat(`${authResponse.authorize.balance}`);
             this.stats.currentBalance = this.stats.initialBalance;
+
+            console.log('reach this stage');
+            
             
             this.displayWelcomeMessage(authResponse);
             await this.startTrading();
@@ -120,17 +126,20 @@ class DerivTrader {
     }
     
     processTick(tick) {
-        if (this.ignoreTicks && !this.nextTradeReady) {
-            return;
-        }
-        
         const lastDigit = this.getLastDigit(tick.quote, tick.pip_size);
         const isEven = lastDigit % 2 === 0;
         
-        // If we're ready to place the next trade (Martingale after prediction)
-        if (this.nextTradeReady && this.activeContractId) {
-            // We're waiting for the current contract to finish, but already preparing the next trade
-            logger.debug(`Tick while waiting for contract to finish: ${tick.quote} (${lastDigit}) - ${isEven ? 'Even' : 'Odd'}`);
+        // Check if we should place the next trade immediately based on prediction
+        if (this.nextTradeReady && this.pendingContractType) {
+            logger.info(`Placing predicted follow-up trade immediately: ${this.pendingContractType}`);
+            this.placeTrade(this.pendingContractType);
+            this.pendingContractType = null;
+            this.nextTradeReady = false;
+            return;
+        }
+        
+        // If we're ignoring ticks, don't process further
+        if (this.ignoreTicks) {
             return;
         }
         
@@ -165,6 +174,7 @@ class DerivTrader {
             this.ignoreTicks = true;
             this.currentContractType = contractType;
             this.predictionMade = false;
+            this.pendingContractType = null;
             
             // Check if we've hit max consecutive losses
             const martingaleMultipliers = config.get('MARTINGALE_MULTIPLIERS');
@@ -251,7 +261,7 @@ class DerivTrader {
         this.ignoreTicks = false;
     }
     
-    // New method to predict the contract outcome based on tick data
+    // Predict the contract outcome based on tick data
     predictContractStatus(contract) {
         if (!contract.tick_stream || contract.tick_stream.length === 0) {
             logger.debug('No tick stream available for prediction');
@@ -294,19 +304,24 @@ class DerivTrader {
             
             if (prediction === 'lost') {
                 logger.warning(`Prediction: Contract will likely be LOST. Preparing next trade...`);
-                this.nextTradeReady = true;
-                this.predictionMade = true;
                 
                 // Increment loss count immediately for next trade preparation
                 this.lossCount++;
                 
-                // Reset ignore ticks so we can start gathering data for next trade
+                // Determine the next contract type based on current one
+                this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITODD' : 'DIGITEVEN';
+                
+                // Set up for immediate next trade
+                this.nextTradeReady = true;
+                this.predictionMade = true;
+                
+                // Reset ignore ticks so we can process the next tick for immediate trading
                 this.ignoreTicks = false;
+                
             } else if (prediction === 'won') {
                 logger.success(`Prediction: Contract will likely be WON`);
                 this.predictionMade = true;
-                // Reset strategy when we predict a win
-                this.resetStrategy();
+                // We'll reset strategy when contract finishes
             }
         }
         
@@ -329,17 +344,12 @@ class DerivTrader {
                 this.stats.lostTrades++;
                 logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
                 
-                // Only increment lossCount if we haven't done so in the prediction
+                // If we haven't already made a prediction, increment the loss count now
                 if (!this.predictionMade) {
                     this.lossCount++;
-                }
-                
-                // If we already made preparations based on our prediction
-                if (this.nextTradeReady) {
-                    logger.info('Next trade already prepared based on prediction');
-                } else {
                     this.prepareNextTrade();
                 }
+                // If we already have pendingContractType, the next tick will trigger the trade
             }
             
             // Display updated statistics
@@ -354,7 +364,6 @@ class DerivTrader {
             });
             
             this.activeContractId = null;
-            this.nextTradeReady = false;
         }
     }
     
@@ -377,7 +386,11 @@ class DerivTrader {
     }
     
     prepareNextTrade() {
-        // If we lost, prepare for next trade with same strategy
+        // If we lost, prepare for next trade with opposite contract type
+        if (this.currentContractType) {
+            this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITODD' : 'DIGITEVEN';
+            logger.info(`Preparing next trade: ${this.pendingContractType} (after loss)`);
+        }
         this.ignoreTicks = false;
     }
     
@@ -393,6 +406,7 @@ class DerivTrader {
         this.predictedOutcome = null;
         this.nextTradeReady = false;
         this.predictionMade = false;
+        this.pendingContractType = null;
     }
     
     displayTradeStats() {
