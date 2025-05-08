@@ -24,6 +24,8 @@ class DerivTrader {
         this.tickSubscriptionId = null;
         this.predictedOutcome = null;
         this.currentContractType = null;
+        this.nextTradeReady = false;
+        this.predictionMade = false;
         
         // Statistics
         this.stats = {
@@ -118,12 +120,19 @@ class DerivTrader {
     }
     
     processTick(tick) {
-        if (this.ignoreTicks || this.activeContractId) {
+        if (this.ignoreTicks && !this.nextTradeReady) {
             return;
         }
         
         const lastDigit = this.getLastDigit(tick.quote, tick.pip_size);
         const isEven = lastDigit % 2 === 0;
+        
+        // If we're ready to place the next trade (Martingale after prediction)
+        if (this.nextTradeReady && this.activeContractId) {
+            // We're waiting for the current contract to finish, but already preparing the next trade
+            logger.debug(`Tick while waiting for contract to finish: ${tick.quote} (${lastDigit}) - ${isEven ? 'Even' : 'Odd'}`);
+            return;
+        }
         
         // Update consecutive counters
         if (isEven) {
@@ -155,6 +164,7 @@ class DerivTrader {
             // Ignore ticks while placing a trade
             this.ignoreTicks = true;
             this.currentContractType = contractType;
+            this.predictionMade = false;
             
             // Check if we've hit max consecutive losses
             const martingaleMultipliers = config.get('MARTINGALE_MULTIPLIERS');
@@ -241,9 +251,61 @@ class DerivTrader {
         this.ignoreTicks = false;
     }
     
+    // New method to predict the contract outcome based on tick data
+    predictContractStatus(contract) {
+        if (!contract.tick_stream || contract.tick_stream.length === 0) {
+            logger.debug('No tick stream available for prediction');
+            return null;
+        }
+        
+        // Get the current last digit from the exit tick or the latest tick in the stream
+        const lastTickValue = contract.exit_tick_display_value || 
+                             (contract.tick_stream.length > 0 ? 
+                              contract.tick_stream[contract.tick_stream.length - 1].tick_display_value : 
+                              null);
+        
+        if (!lastTickValue) {
+            logger.debug('No tick value available for prediction');
+            return null;
+        }
+        
+        const lastDigit = Number(lastTickValue.slice(-1));
+        const isEvenTick = (lastDigit % 2 === 0);
+        
+        logger.debug(`Predicting outcome based on last digit: ${lastDigit} (${isEvenTick ? 'Even' : 'Odd'})`);
+        
+        // Determine if we'll win or lose based on our contract type
+        if ((isEvenTick && this.currentContractType === 'DIGITEVEN') || 
+            (!isEvenTick && this.currentContractType === 'DIGITODD')) {
+            return 'won';
+        } else {
+            return 'lost';
+        }
+    }
+    
     processContractUpdate(contract) {
         if (contract.contract_id !== this.activeContractId) {
             return;
+        }
+        
+        // Make prediction for early preparation of next trade if we haven't already
+        if (!this.predictionMade && contract.tick_stream && contract.tick_stream.length > 0) {
+            const prediction = this.predictContractStatus(contract);
+            
+            if (prediction === 'lost') {
+                logger.warning(`Prediction: Contract will likely be LOST. Preparing next trade...`);
+                this.nextTradeReady = true;
+                this.predictionMade = true;
+                
+                // Increment loss count immediately for next trade preparation
+                this.lossCount++;
+                
+                // Reset ignore ticks so we can start gathering data for next trade
+                this.ignoreTicks = false;
+            } else if (prediction === 'won') {
+                logger.success(`Prediction: Contract will likely be WON`);
+                this.predictionMade = true;
+            }
         }
         
         // Only process when contract is finished
@@ -258,12 +320,24 @@ class DerivTrader {
             if (isWin) {
                 this.stats.wonTrades++;
                 logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+                
+                // Reset strategy on win regardless of prediction
                 this.resetStrategy();
             } else {
                 this.stats.lostTrades++;
                 logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
-                this.lossCount++;
-                this.prepareNextTrade();
+                
+                // Only increment lossCount if we haven't done so in the prediction
+                if (!this.predictionMade) {
+                    this.lossCount++;
+                }
+                
+                // If we already made preparations based on our prediction
+                if (this.nextTradeReady) {
+                    logger.info('Next trade already prepared based on prediction');
+                } else {
+                    this.prepareNextTrade();
+                }
             }
             
             // Display updated statistics
@@ -278,6 +352,7 @@ class DerivTrader {
             });
             
             this.activeContractId = null;
+            this.nextTradeReady = false;
         }
     }
     
@@ -313,6 +388,8 @@ class DerivTrader {
         this.activeContractId = null;
         this.currentContractType = null;
         this.predictedOutcome = null;
+        this.nextTradeReady = false;
+        this.predictionMade = false;
     }
     
     displayTradeStats() {
