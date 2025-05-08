@@ -305,6 +305,8 @@ class DerivTrader {
             } else if (prediction === 'won') {
                 logger.success(`Prediction: Contract will likely be WON`);
                 this.predictionMade = true;
+                // Reset strategy when we predict a win
+                this.resetStrategy();
             }
         }
         
@@ -321,7 +323,7 @@ class DerivTrader {
                 this.stats.wonTrades++;
                 logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
                 
-                // Reset strategy on win regardless of prediction
+                // Reset strategy on win
                 this.resetStrategy();
             } else {
                 this.stats.lostTrades++;
@@ -381,6 +383,7 @@ class DerivTrader {
     
     resetStrategy() {
         // Reset all trading state
+        logger.info('Resetting trading strategy...');
         this.consecutiveOdd = 0;
         this.consecutiveEven = 0;
         this.lossCount = 0;
