@@ -43,7 +43,7 @@ class DerivTrader {
     async initialize() {
         try {
             this.validateInputs();
-            await this.api.connect();
+            await this.api.connect(this.startTrading);
             
             // Authorize and get account info
             const authResponse = await this.api.authorize();
@@ -317,11 +317,12 @@ class DerivTrader {
                 
                 // Reset ignore ticks so we can process the next tick for immediate trading
                 this.ignoreTicks = false;
-
-                if (!this.predictionMade) {
-                    this.lossCount++;
-                    this.prepareNextTrade();
-                }
+                
+                // Remove this duplicate block that causes the loss count to increment twice
+                // if (!this.predictionMade) {
+                //     this.lossCount++;
+                //     this.prepareNextTrade();
+                // }
                 
             } else if (prediction === 'won') {
                 logger.success(`Prediction: Contract WON`);
@@ -344,9 +345,18 @@ class DerivTrader {
             if (isWin) {
                 this.stats.wonTrades++;
                 logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+                
+                // IMPORTANT: Always reset strategy on win to ensure we start at the initial stake
+                this.resetStrategy();
             } else {
                 this.stats.lostTrades++;
                 logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
+                
+                // If we haven't already predicted a loss, increment loss count here
+                if (!this.predictionMade) {
+                    this.lossCount++;
+                    this.prepareNextTrade();
+                }
             }
             
             // Display updated statistics

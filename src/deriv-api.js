@@ -22,7 +22,7 @@ class DerivAPI {
     }
 
     // Connect to the Deriv WebSocket API
-    connect() {
+    connect(callBackOnReconnect) {
         return new Promise((resolve, reject) => {
             try {
                 const apiUrl = config.get('API_URL');
@@ -44,7 +44,7 @@ class DerivAPI {
                     
                     // Attempt to reconnect if not a deliberate disconnect
                     if (!event.wasClean && this.reconnectAttempts < this.maxReconnectAttempts) {
-                        this.scheduleReconnect();
+                        this.scheduleReconnect(callBackOnReconnect);
                     }
                 };
                 
@@ -105,7 +105,7 @@ class DerivAPI {
         });
     }
     
-    scheduleReconnect() {
+    scheduleReconnect(callBackOnReconnect) {
         this.reconnectAttempts++;
         const delay = Math.min(30000, Math.pow(2, this.reconnectAttempts) * 1000); // Exponential backoff
         
@@ -117,6 +117,7 @@ class DerivAPI {
                 await this.connect();
                 if (this.connected) {
                     await this.authorize();
+                    callBackOnReconnect();
                 }
             } catch (error) {
                 logger.error('Reconnection failed:', error.message);
