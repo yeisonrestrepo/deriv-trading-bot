@@ -303,13 +303,13 @@ class DerivTrader {
             const prediction = this.predictContractStatus(contract);
             
             if (prediction === 'lost') {
-                logger.warning(`Prediction: Contract will likely be LOST. Preparing next trade...`);
+                logger.warning(`Prediction: Contract LOST. Preparing next trade...`);
                 
                 // Increment loss count immediately for next trade preparation
                 this.lossCount++;
                 
                 // Determine the next contract type based on current one
-                this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITODD' : 'DIGITEVEN';
+                this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITEVEN' : 'DIGITODD';
                 
                 // Set up for immediate next trade
                 this.nextTradeReady = true;
@@ -317,11 +317,18 @@ class DerivTrader {
                 
                 // Reset ignore ticks so we can process the next tick for immediate trading
                 this.ignoreTicks = false;
+
+                if (!this.predictionMade) {
+                    this.lossCount++;
+                    this.prepareNextTrade();
+                }
                 
             } else if (prediction === 'won') {
-                logger.success(`Prediction: Contract will likely be WON`);
+                logger.success(`Prediction: Contract WON`);
                 this.predictionMade = true;
-                // We'll reset strategy when contract finishes
+                
+                // Reset strategy on win
+                this.resetStrategy();
             }
         }
         
@@ -337,19 +344,9 @@ class DerivTrader {
             if (isWin) {
                 this.stats.wonTrades++;
                 logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
-                
-                // Reset strategy on win
-                this.resetStrategy();
             } else {
                 this.stats.lostTrades++;
                 logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
-                
-                // If we haven't already made a prediction, increment the loss count now
-                if (!this.predictionMade) {
-                    this.lossCount++;
-                    this.prepareNextTrade();
-                }
-                // If we already have pendingContractType, the next tick will trigger the trade
             }
             
             // Display updated statistics
