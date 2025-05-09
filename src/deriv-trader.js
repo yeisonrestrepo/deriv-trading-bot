@@ -2,7 +2,7 @@
  * Deriv Trader Bot - Main trading module
  * 
  * Automated trading bot for Deriv.com that implements an odd/even digit pattern strategy 
- * with Martingale progression.
+ * with Martingale progression, supporting multiple symbols simultaneously.
  */
 
 const { DerivAPI } = require('./deriv-api');
@@ -12,32 +12,24 @@ const logger = require('./utils/logger');
 class DerivTrader {
     constructor() {
         this.api = new DerivAPI();
-        this.symbol = config.get('DEFAULT_SYMBOL');
+        
+        // List of symbols to trade (default: all allowed symbols)
+        this.symbols = config.get('SYMBOLS_TO_TRADE') || config.get('ALLOWED_SYMBOLS');
         this.maxTicks = config.get('MAX_CONSECUTIVE_DIGITS');
         
-        // Trading state
-        this.consecutiveOdd = 0;
-        this.consecutiveEven = 0;
-        this.lossCount = 0;
-        this.ignoreTicks = false;
-        this.activeContractId = null;
-        this.tickSubscriptionId = null;
-        this.predictedOutcome = null;
-        this.currentContractType = null;
-        this.nextTradeReady = false;
-        this.predictionMade = false;
-        this.pendingContractType = null; // Add this to track the next trade to place
-                
-        // Statistics
+        // Track state for each symbol independently
+        this.symbolData = new Map();
+        
+        // Overall statistics
         this.stats = {
             totalTrades: 0,
             wonTrades: 0,
             lostTrades: 0,
             initialBalance: 0,
             currentBalance: 0,
-            profit: 0
+            profit: 0,
+            symbolPerformance: {}
         };
-
     }
 
     async initialize() {
@@ -47,12 +39,8 @@ class DerivTrader {
             
             // Authorize and get account info
             const authResponse = await this.api.authorize();
-            console.log(authResponse.authorize.balance);
             this.stats.initialBalance = parseFloat(`${authResponse.authorize.balance}`);
             this.stats.currentBalance = this.stats.initialBalance;
-
-            console.log('reach this stage');
-            
             
             this.displayWelcomeMessage(authResponse);
             await this.startTrading();
@@ -67,8 +55,11 @@ class DerivTrader {
     }
     
     validateInputs() {
-        if (!config.get('ALLOWED_SYMBOLS').includes(this.symbol)) {
-            throw new Error(`Symbol ${this.symbol} is not allowed. Valid symbols: ${config.get('ALLOWED_SYMBOLS').join(', ')}`);
+        // Validate each symbol
+        for (const symbol of this.symbols) {
+            if (!config.get('ALLOWED_SYMBOLS').includes(symbol)) {
+                throw new Error(`Symbol ${symbol} is not allowed. Valid symbols: ${config.get('ALLOWED_SYMBOLS').join(', ')}`);
+            }
         }
         
         if (isNaN(this.maxTicks) || this.maxTicks <= 0) {
@@ -78,9 +69,9 @@ class DerivTrader {
     
     displayWelcomeMessage(authData) {
         logger.divider('*', 65);
-        logger.info('                   WELCOME TO DERIV TRADER                      ');
+        logger.info('                WELCOME TO MULTI-SYMBOL DERIV TRADER              ');
         logger.divider('*', 65);
-        logger.info(`SYMBOL: ${this.symbol}`);
+        logger.info(`TRADING SYMBOLS: ${this.symbols.join(', ')}`);
         logger.info(`Strategy: ODD/EVEN > ${this.maxTicks} consecutive digits`);
         logger.info(`DATE: ${new Date().toLocaleString()}`);
         logger.info(`ACCOUNT: ${authData.authorize.loginid}`);
@@ -94,19 +85,56 @@ class DerivTrader {
     }
     
     async startTrading() {
-        logger.info('Starting trade monitoring...\n');
+        logger.info('Starting multi-symbol trade monitoring...\n');
+        
+        // Initialize tracking for each symbol
+        for (const symbol of this.symbols) {
+            this.initializeSymbolData(symbol);
+            
+            // Set up per-symbol statistics
+            this.stats.symbolPerformance[symbol] = {
+                trades: 0,
+                wins: 0,
+                losses: 0,
+                profit: 0
+            };
+        }
+        
+        // Subscribe to ticks for all symbols
         await this.subscribeToTicks();
+    }
+    
+    initializeSymbolData(symbol) {
+        this.symbolData.set(symbol, {
+            consecutiveOdd: 0,
+            consecutiveEven: 0,
+            lossCount: 0,
+            ignoreTicks: false,
+            activeContractId: null,
+            tickSubscriptionId: null,
+            predictedOutcome: null,
+            currentContractType: null,
+            nextTradeReady: false,
+            predictionMade: false,
+            pendingContractType: null,
+            lastDigit: null,
+            lastUpdate: Date.now()
+        });
     }
     
     async subscribeToTicks() {
         try {
-            const tickResponse = await this.api.send({
-                ticks: this.symbol,
-                subscribe: 1
-            });
-            
-            this.tickSubscriptionId = tickResponse.subscription.id;
-            logger.success(`Subscribed to ${this.symbol} tick stream`);
+            // Subscribe to each symbol
+            for (const symbol of this.symbols) {
+                const tickResponse = await this.api.send({
+                    ticks: symbol,
+                    subscribe: 1
+                });
+                
+                const data = this.symbolData.get(symbol);
+                data.tickSubscriptionId = tickResponse.subscription.id;
+                logger.success(`Subscribed to ${symbol} tick stream`);
+            }
             
             // Set up the event handler for incoming ticks
             this.api.socket.addEventListener('message', (event) => {
@@ -126,41 +154,53 @@ class DerivTrader {
     }
     
     processTick(tick) {
-        const lastDigit = this.getLastDigit(tick.quote, tick.pip_size);
-        const isEven = lastDigit % 2 === 0;
+        const symbol = tick.symbol;
         
-        // Check if we should place the next trade immediately based on prediction
-        if (this.nextTradeReady && this.pendingContractType) {
-            logger.info(`Placing predicted follow-up trade immediately: ${this.pendingContractType}`);
-            this.placeTrade(this.pendingContractType);
-            this.pendingContractType = null;
-            this.nextTradeReady = false;
+        // Skip if we're not tracking this symbol
+        if (!this.symbolData.has(symbol)) {
             return;
         }
         
-        // If we're ignoring ticks, don't process further
-        if (this.ignoreTicks) {
+        const data = this.symbolData.get(symbol);
+        const lastDigit = this.getLastDigit(tick.quote, tick.pip_size);
+        const isEven = lastDigit % 2 === 0;
+        
+        // Update the last seen digit
+        data.lastDigit = lastDigit;
+        data.lastUpdate = Date.now();
+        
+        // Check if we should place the next trade immediately based on prediction
+        if (data.nextTradeReady && data.pendingContractType) {
+            logger.info(`[${symbol}] Placing predicted follow-up trade immediately: ${data.pendingContractType}`);
+            this.placeTrade(symbol, data.pendingContractType);
+            data.pendingContractType = null;
+            data.nextTradeReady = false;
+            return;
+        }
+        
+        // If we're ignoring ticks for this symbol, don't process further
+        if (data.ignoreTicks) {
             return;
         }
         
         // Update consecutive counters
         if (isEven) {
-            this.consecutiveEven++;
-            this.consecutiveOdd = 0;
-            logger.debug(`Tick: ${tick.quote} (${lastDigit}) - Even (${this.consecutiveEven}/${this.maxTicks})`);
+            data.consecutiveEven++;
+            data.consecutiveOdd = 0;
+            logger.debug(`[${symbol}] Tick: ${tick.quote} (${lastDigit}) - Even (${data.consecutiveEven}/${this.maxTicks})`);
         } else {
-            this.consecutiveOdd++;
-            this.consecutiveEven = 0;
-            logger.debug(`Tick: ${tick.quote} (${lastDigit}) - Odd (${this.consecutiveOdd}/${this.maxTicks})`);
+            data.consecutiveOdd++;
+            data.consecutiveEven = 0;
+            logger.debug(`[${symbol}] Tick: ${tick.quote} (${lastDigit}) - Odd (${data.consecutiveOdd}/${this.maxTicks})`);
         }
         
         // Check if we should place a trade
-        if (this.consecutiveEven >= this.maxTicks) {
+        if (data.consecutiveEven >= this.maxTicks) {
             // After consecutive even digits, bet on ODD
-            this.placeTrade('DIGITODD');
-        } else if (this.consecutiveOdd >= this.maxTicks) {
+            this.placeTrade(symbol, 'DIGITODD');
+        } else if (data.consecutiveOdd >= this.maxTicks) {
             // After consecutive odd digits, bet on EVEN
-            this.placeTrade('DIGITEVEN');
+            this.placeTrade(symbol, 'DIGITEVEN');
         }
     }
     
@@ -168,38 +208,40 @@ class DerivTrader {
         return parseInt(quote.toFixed(pipSize).slice(-1));
     }
     
-    async placeTrade(contractType) {
+    async placeTrade(symbol, contractType) {
         try {
+            const data = this.symbolData.get(symbol);
+            
             // Ignore ticks while placing a trade
-            this.ignoreTicks = true;
-            this.currentContractType = contractType;
-            this.predictionMade = false;
-            this.pendingContractType = null;
+            data.ignoreTicks = true;
+            data.currentContractType = contractType;
+            data.predictionMade = false;
+            data.pendingContractType = null;
             
             // Check if we've hit max consecutive losses
             const martingaleMultipliers = config.get('MARTINGALE_MULTIPLIERS');
-            if (this.lossCount >= martingaleMultipliers.length) {
-                logger.warning('Reached maximum consecutive losses. Resetting strategy.');
-                this.resetStrategy();
+            if (data.lossCount >= martingaleMultipliers.length) {
+                logger.warning(`[${symbol}] Reached maximum consecutive losses. Resetting strategy.`);
+                this.resetStrategy(symbol);
                 return;
             }
             
             // Determine stake amount using Martingale strategy
-            const stake = martingaleMultipliers[this.lossCount];
+            const stake = martingaleMultipliers[data.lossCount];
             
             // Check if trading is enabled (for simulation mode)
             if (!config.get('TRADING_ENABLED')) {
-                logger.trade(`[SIMULATION] Would place ${contractType} trade with stake ${stake} ${config.get('CURRENCY')}`);
+                logger.trade(`[SIMULATION] [${symbol}] Would place ${contractType} trade with stake ${stake} ${config.get('CURRENCY')}`);
                 // Simulate a random win/loss outcome in simulation mode
                 setTimeout(() => {
                     const randomOutcome = Math.random() > 0.5;
-                    this.simulateTradeOutcome(randomOutcome, stake);
+                    this.simulateTradeOutcome(symbol, randomOutcome, stake);
                 }, 2000);
                 return;
             }
             
             // Log the trade we're about to place
-            logger.tradeStart(contractType, stake, this.symbol);
+            logger.tradeStart(contractType, stake, symbol);
             
             // Buy contract
             const contractResponse = await this.api.send({
@@ -212,7 +254,7 @@ class DerivTrader {
                     currency: config.get('CURRENCY'),
                     duration: config.get('CONTRACT_DURATION'),
                     duration_unit: config.get('CONTRACT_DURATION_UNIT'),
-                    symbol: this.symbol
+                    symbol: symbol
                 }
             });
             
@@ -220,51 +262,59 @@ class DerivTrader {
                 throw new Error(contractResponse.error.message);
             }
             
-            this.activeContractId = contractResponse.buy.contract_id;
+            data.activeContractId = contractResponse.buy.contract_id;
             this.stats.totalTrades++;
+            this.stats.symbolPerformance[symbol].trades++;
             
             // Subscribe to contract updates
             await this.api.send({
                 proposal_open_contract: 1,
-                contract_id: this.activeContractId,
+                contract_id: data.activeContractId,
                 subscribe: 1
             });
             
         } catch (error) {
-            logger.error('Error placing trade:', error.message || error);
-            this.resetStrategy();
+            logger.error(`[${symbol}] Error placing trade:`, error.message || error);
+            this.resetStrategy(symbol);
         }
     }
     
     // Simulate a trade outcome (for simulation mode)
-    simulateTradeOutcome(isWin, stake) {
+    simulateTradeOutcome(symbol, isWin, stake) {
+        const data = this.symbolData.get(symbol);
         const profit = isWin ? stake * 0.95 : -stake; // Assume 95% payout
         
         // Update statistics
         this.stats.totalTrades++;
         this.stats.currentBalance += profit;
         this.stats.profit += profit;
+        this.stats.symbolPerformance[symbol].trades++;
+        this.stats.symbolPerformance[symbol].profit += profit;
         
         if (isWin) {
             this.stats.wonTrades++;
-            logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
-            this.resetStrategy();
+            this.stats.symbolPerformance[symbol].wins++;
+            logger.tradeWin(`[${symbol}] ${data.currentContractType}`, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+            this.resetStrategy(symbol);
         } else {
             this.stats.lostTrades++;
-            logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
-            this.lossCount++;
-            this.prepareNextTrade();
+            this.stats.symbolPerformance[symbol].losses++;
+            logger.tradeLoss(`[${symbol}] ${data.currentContractType}`, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
+            data.lossCount++;
+            this.prepareNextTrade(symbol);
         }
         
         // Display updated statistics
         this.displayTradeStats();
-        this.ignoreTicks = false;
+        data.ignoreTicks = false;
     }
     
     // Predict the contract outcome based on tick data
-    predictContractStatus(contract) {
+    predictContractStatus(symbol, contract) {
+        const data = this.symbolData.get(symbol);
+        
         if (!contract.tick_stream || contract.tick_stream.length === 0) {
-            logger.debug('No tick stream available for prediction');
+            logger.debug(`[${symbol}] No tick stream available for prediction`);
             return null;
         }
         
@@ -275,18 +325,18 @@ class DerivTrader {
                               null);
         
         if (!lastTickValue) {
-            logger.debug('No tick value available for prediction');
+            logger.debug(`[${symbol}] No tick value available for prediction`);
             return null;
         }
         
         const lastDigit = Number(lastTickValue.slice(-1));
         const isEvenTick = (lastDigit % 2 === 0);
         
-        logger.debug(`Predicting outcome based on last digit: ${lastDigit} (${isEvenTick ? 'Even' : 'Odd'})`);
+        logger.debug(`[${symbol}] Predicting outcome based on last digit: ${lastDigit} (${isEvenTick ? 'Even' : 'Odd'})`);
         
         // Determine if we'll win or lose based on our contract type
-        if ((isEvenTick && this.currentContractType === 'DIGITEVEN') || 
-            (!isEvenTick && this.currentContractType === 'DIGITODD')) {
+        if ((isEvenTick && data.currentContractType === 'DIGITEVEN') || 
+            (!isEvenTick && data.currentContractType === 'DIGITODD')) {
             return 'won';
         } else {
             return 'lost';
@@ -294,41 +344,48 @@ class DerivTrader {
     }
     
     processContractUpdate(contract) {
-        if (contract.contract_id !== this.activeContractId) {
-            return;
+        // Find which symbol this contract belongs to
+        let contractSymbol = null;
+        let symbolData = null;
+        
+        for (const [symbol, data] of this.symbolData.entries()) {
+            if (data.activeContractId === contract.contract_id) {
+                contractSymbol = symbol;
+                symbolData = data;
+                break;
+            }
+        }
+        
+        if (!contractSymbol || !symbolData) {
+            return; // Not one of our contracts
         }
         
         // Make prediction for early preparation of next trade if we haven't already
-        if (!this.predictionMade && contract.tick_stream && contract.tick_stream.length > 0) {
-            const prediction = this.predictContractStatus(contract);
+        if (!symbolData.predictionMade && contract.tick_stream && contract.tick_stream.length > 0) {
+            const prediction = this.predictContractStatus(contractSymbol, contract);
             
             if (prediction === 'lost') {
-                logger.warning(`Prediction: Contract LOST. Preparing next trade...`);
+                logger.warning(`[${contractSymbol}] Prediction: Contract LOST. Preparing next trade...`);
                 
                 // Increment loss count immediately for next trade preparation
-                this.lossCount++;
+                symbolData.lossCount++;
                 
                 // Determine the next contract type based on current one
-                this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITEVEN' : 'DIGITODD';
+                symbolData.pendingContractType = (symbolData.currentContractType === 'DIGITEVEN') ? 'DIGITEVEN' : 'DIGITODD';
                 
                 // Set up for immediate next trade
-                this.nextTradeReady = true;
-                this.predictionMade = true;
+                symbolData.nextTradeReady = true;
+                symbolData.predictionMade = true;
                 
                 // Reset ignore ticks so we can process the next tick for immediate trading
-                this.ignoreTicks = false;
-
-                if (!this.predictionMade) {
-                    this.lossCount++;
-                    this.prepareNextTrade();
-                }
+                symbolData.ignoreTicks = false;
                 
             } else if (prediction === 'won') {
-                logger.success(`Prediction: Contract WON`);
-                this.predictionMade = true;
+                logger.success(`[${contractSymbol}] Prediction: Contract WON`);
+                symbolData.predictionMade = true;
                 
                 // Reset strategy on win
-                this.resetStrategy();
+                this.resetStrategy(contractSymbol);
             }
         }
         
@@ -337,16 +394,24 @@ class DerivTrader {
             const isWin = contract.profit >= 0;
             const profit = parseFloat(contract.profit);
             
-            // Update statistics
+            // Update overall statistics
             this.stats.currentBalance = parseFloat(contract.balance_after);
             this.stats.profit += profit;
             
+            // Update symbol-specific statistics
+            this.stats.symbolPerformance[contractSymbol].profit += profit;
+            
             if (isWin) {
                 this.stats.wonTrades++;
-                logger.tradeWin(this.currentContractType, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+                this.stats.symbolPerformance[contractSymbol].wins++;
+                logger.tradeWin(`[${contractSymbol}] ${symbolData.currentContractType}`, profit.toFixed(2), this.stats.currentBalance.toFixed(2));
+                this.resetStrategy(contractSymbol);
             } else {
                 this.stats.lostTrades++;
-                logger.tradeLoss(this.currentContractType, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
+                this.stats.symbolPerformance[contractSymbol].losses++;
+                logger.tradeLoss(`[${contractSymbol}] ${symbolData.currentContractType}`, Math.abs(profit).toFixed(2), this.stats.currentBalance.toFixed(2));
+                symbolData.lossCount++;
+                this.prepareNextTrade(contractSymbol);
             }
             
             // Display updated statistics
@@ -360,17 +425,21 @@ class DerivTrader {
                 forget: contract.id
             });
             
-            this.activeContractId = null;
+            symbolData.activeContractId = null;
         }
     }
     
     checkSafetyLimits() {
-        // Check maximum consecutive losses
+        // Check maximum consecutive losses for any symbol
         const maxConsecutiveLosses = config.get('MAX_CONSECUTIVE_LOSSES');
-        if (maxConsecutiveLosses && this.lossCount >= maxConsecutiveLosses) {
-            logger.critical(`Safety limit reached: ${this.lossCount} consecutive losses`);
-            this.shutdown();
-            return;
+        if (maxConsecutiveLosses) {
+            for (const [symbol, data] of this.symbolData.entries()) {
+                if (data.lossCount >= maxConsecutiveLosses) {
+                    logger.critical(`Safety limit reached: ${data.lossCount} consecutive losses on ${symbol}`);
+                    this.shutdown();
+                    return;
+                }
+            }
         }
         
         // Check maximum daily loss
@@ -382,28 +451,32 @@ class DerivTrader {
         }
     }
     
-    prepareNextTrade() {
+    prepareNextTrade(symbol) {
+        const data = this.symbolData.get(symbol);
+        
         // If we lost, prepare for next trade with opposite contract type
-        if (this.currentContractType) {
-            this.pendingContractType = (this.currentContractType === 'DIGITEVEN') ? 'DIGITODD' : 'DIGITEVEN';
-            logger.info(`Preparing next trade: ${this.pendingContractType} (after loss)`);
+        if (data.currentContractType) {
+            data.pendingContractType = (data.currentContractType === 'DIGITEVEN') ? 'DIGITODD' : 'DIGITEVEN';
+            logger.info(`[${symbol}] Preparing next trade: ${data.pendingContractType} (after loss)`);
         }
-        this.ignoreTicks = false;
+        data.ignoreTicks = false;
     }
     
-    resetStrategy() {
-        // Reset all trading state
-        logger.info('Resetting trading strategy...');
-        this.consecutiveOdd = 0;
-        this.consecutiveEven = 0;
-        this.lossCount = 0;
-        this.ignoreTicks = false;
-        this.activeContractId = null;
-        this.currentContractType = null;
-        this.predictedOutcome = null;
-        this.nextTradeReady = false;
-        this.predictionMade = false;
-        this.pendingContractType = null;
+    resetStrategy(symbol) {
+        const data = this.symbolData.get(symbol);
+        
+        // Reset all trading state for this symbol
+        logger.info(`[${symbol}] Resetting trading strategy...`);
+        data.consecutiveOdd = 0;
+        data.consecutiveEven = 0;
+        data.lossCount = 0;
+        data.ignoreTicks = false;
+        data.activeContractId = null;
+        data.currentContractType = null;
+        data.predictedOutcome = null;
+        data.nextTradeReady = false;
+        data.predictionMade = false;
+        data.pendingContractType = null;
     }
     
     displayTradeStats() {
@@ -411,7 +484,7 @@ class DerivTrader {
             ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) 
             : 0;
             
-        // Create statistics object
+        // Create overall statistics object
         const statistics = {
             'Total Trades': this.stats.totalTrades,
             'Won': `${this.stats.wonTrades} (${winRate}%)`,
@@ -420,8 +493,23 @@ class DerivTrader {
             'Profit/Loss': `${this.stats.profit >= 0 ? '+' : ''}${this.stats.profit.toFixed(2)} ${config.get('CURRENCY')}`
         };
         
-        // Log the statistics using the logger's stats method
+        // Log the overall statistics using the logger's stats method
         logger.stats(statistics);
+        
+        // Log per-symbol statistics if in detailed mode
+        if (config.get('LOG_LEVEL') === 'DEBUG') {
+            logger.divider('-', 50);
+            logger.info('PERFORMANCE BY SYMBOL:');
+            
+            for (const symbol of this.symbols) {
+                const symbolStats = this.stats.symbolPerformance[symbol];
+                const symbolWinRate = symbolStats.trades > 0 
+                    ? ((symbolStats.wins / symbolStats.trades) * 100).toFixed(2) 
+                    : 0;
+                
+                logger.info(`${symbol}: ${symbolStats.trades} trades, ${symbolWinRate}% win rate, ${symbolStats.profit >= 0 ? '+' : ''}${symbolStats.profit.toFixed(2)} ${config.get('CURRENCY')}`);
+            }
+        }
     }
     
     setupShutdownHandlers() {
@@ -438,19 +526,21 @@ class DerivTrader {
     async shutdown() {
         logger.info('\nShutting down trading bot...');
         
-        // Display final statistics
-        if (this.tickSubscriptionId) {
-            try {
-                await this.api.send({
-                    forget: this.tickSubscriptionId
-                });
-                logger.info('Unsubscribed from tick stream');
-            } catch (error) {
-                logger.error('Error unsubscribing from ticks:', error.message);
+        // Unsubscribe from all tick streams
+        for (const [symbol, data] of this.symbolData.entries()) {
+            if (data.tickSubscriptionId) {
+                try {
+                    await this.api.send({
+                        forget: data.tickSubscriptionId
+                    });
+                    logger.info(`Unsubscribed from ${symbol} tick stream`);
+                } catch (error) {
+                    logger.error(`Error unsubscribing from ${symbol} ticks:`, error.message);
+                }
             }
         }
         
-        // Get final balance
+        // Display final statistics
         try {
             const balanceResponse = await this.api.send({
                 balance: 1,
@@ -467,6 +557,21 @@ class DerivTrader {
             logger.info(`Total Profit/Loss: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(2)} ${config.get('CURRENCY')}`);
             logger.info(`Total Trades: ${this.stats.totalTrades}`);
             logger.info(`Win Rate: ${this.stats.totalTrades > 0 ? ((this.stats.wonTrades / this.stats.totalTrades) * 100).toFixed(2) : 0}%`);
+            
+            // Display per-symbol results
+            logger.divider('-', 65);
+            logger.info('SYMBOL PERFORMANCE:');
+            
+            for (const symbol of this.symbols) {
+                const symbolStats = this.stats.symbolPerformance[symbol];
+                const symbolWinRate = symbolStats.trades > 0 
+                    ? ((symbolStats.wins / symbolStats.trades) * 100).toFixed(2) 
+                    : 0;
+                
+                logger.info(`${symbol}: ${symbolStats.trades} trades, ${symbolStats.wins} wins, ${symbolStats.losses} losses (${symbolWinRate}% win rate)`);
+                logger.info(`${symbol} Profit/Loss: ${symbolStats.profit >= 0 ? '+' : ''}${symbolStats.profit.toFixed(2)} ${config.get('CURRENCY')}`);
+            }
+            
             logger.divider('=', 65);
         } catch (error) {
             logger.error('Error getting final balance:', error.message);

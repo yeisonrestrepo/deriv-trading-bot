@@ -34,6 +34,10 @@ const DEFAULT_CONFIG = {
         'RDBEAR', 'RDBULL'
     ],
     
+    // Multi-symbol trading configuration
+    SYMBOLS_TO_TRADE: [], // If empty, will use all ALLOWED_SYMBOLS
+    MULTI_SYMBOL_MODE: false, // Set to true to trade on multiple symbols
+    
     // Connection settings
     RECONNECT_INTERVAL: 5000,  // 5 seconds
     MAX_RECONNECT_ATTEMPTS: 5,
@@ -47,7 +51,12 @@ const DEFAULT_CONFIG = {
     // Trading limits for safety
     MAX_DAILY_LOSS: null,      // Set to a value to limit daily losses
     MAX_CONSECUTIVE_LOSSES: null, // Set to limit consecutive losses
+    MAX_ACTIVE_TRADES: 5,      // Maximum number of simultaneous trades across all symbols
     TRADING_ENABLED: true,     // Can be set to false to run in simulation mode
+    
+    // Advanced options
+    SYMBOL_COOLDOWN: 60000,    // 60 seconds cooldown after a symbol resets its strategy
+    MAX_TRADES_PER_SYMBOL: null, // Maximum number of trades for each symbol (null = unlimited)
 };
 
 /**
@@ -71,6 +80,15 @@ const CONFIG_VALIDATION = {
         type: 'string',
         validate: (value, config) => config.ALLOWED_SYMBOLS.includes(value),
         message: (value) => `Symbol ${value} is not in the list of allowed symbols`
+    },
+    SYMBOLS_TO_TRADE: {
+        required: false,
+        type: 'array',
+        validate: (value, config) => {
+            if (value.length === 0) return true;
+            return value.every(symbol => config.ALLOWED_SYMBOLS.includes(symbol));
+        },
+        message: 'One or more symbols in SYMBOLS_TO_TRADE is not in the list of allowed symbols'
     }
 };
 
@@ -125,7 +143,29 @@ class Config {
     parseCommandLineArgs() {
         const args = process.argv.slice(2);
         
-        // Check for symbol argument
+        // Check for multi-symbol mode flag
+        if (args.includes('--multi') || args.includes('-m')) {
+            this.config.MULTI_SYMBOL_MODE = true;
+            logger.info('Multi-symbol trading mode enabled');
+        }
+        
+        // If specific symbols are provided
+        const symbolsIndex = args.findIndex(arg => arg === '--symbols' || arg === '-s');
+        if (symbolsIndex !== -1 && args[symbolsIndex + 1]) {
+            const symbolsList = args[symbolsIndex + 1].split(',').map(s => s.trim().toUpperCase());
+            
+            // Validate symbols
+            const validSymbols = symbolsList.filter(sym => this.config.ALLOWED_SYMBOLS.includes(sym));
+            
+            if (validSymbols.length > 0) {
+                this.config.SYMBOLS_TO_TRADE = validSymbols;
+                logger.info(`Trading symbols set to: ${validSymbols.join(', ')}`);
+            } else {
+                logger.warning('No valid symbols provided, using default symbol');
+            }
+        }
+        
+        // Check for symbol argument (legacy support)
         if (args[0] && !args[0].startsWith('-')) {
             const symbol = args[0].toUpperCase();
             if (this.config.ALLOWED_SYMBOLS.includes(symbol)) {
@@ -135,7 +175,7 @@ class Config {
             }
         }
         
-        // Check for max consecutive digits argument
+        // Check for max consecutive digits argument (legacy support)
         if (args[1] && !args[1].startsWith('-')) {
             const maxDigits = parseInt(args[1]);
             if (!isNaN(maxDigits) && maxDigits > 0) {
@@ -175,11 +215,18 @@ class Config {
             // Skip further validation if value is not provided
             if (value === null || value === undefined) return;
             
-            // Check type
-            if (rule.type && typeof value !== rule.type && 
-                !(rule.type === 'number' && !isNaN(Number(value)))) {
-                errors.push(`${key} must be of type ${rule.type}`);
-                return;
+            // Check type - FIXED: special handling for arrays
+            if (rule.type) {
+                if (rule.type === 'array') {
+                    if (!Array.isArray(value)) {
+                        errors.push(`${key} must be of type array`);
+                        return;
+                    }
+                } else if (typeof value !== rule.type && 
+                          !(rule.type === 'number' && !isNaN(Number(value)))) {
+                    errors.push(`${key} must be of type ${rule.type}`);
+                    return;
+                }
             }
             
             // Run custom validation
@@ -190,6 +237,18 @@ class Config {
                 errors.push(message);
             }
         });
+        
+        // Additional multi-symbol mode validations
+        if (this.config.MULTI_SYMBOL_MODE) {
+            if (this.config.SYMBOLS_TO_TRADE.length === 0) {
+                logger.info('No specific symbols provided for multi-symbol mode, will use all allowed symbols');
+                this.config.SYMBOLS_TO_TRADE = [...this.config.ALLOWED_SYMBOLS];
+            }
+            
+            if (this.config.MAX_ACTIVE_TRADES < 1) {
+                errors.push('MAX_ACTIVE_TRADES must be at least 1 for multi-symbol mode');
+            }
+        }
         
         // Report validation errors
         if (errors.length > 0) {
@@ -261,6 +320,10 @@ class Config {
             'Trading Parameters': [
                 'DEFAULT_SYMBOL', 'MAX_CONSECUTIVE_DIGITS', 'CURRENCY',
                 'CONTRACT_DURATION', 'CONTRACT_DURATION_UNIT', 'TRADING_ENABLED'
+            ],
+            'Multi-Symbol Mode': [
+                'MULTI_SYMBOL_MODE', 'SYMBOLS_TO_TRADE', 'MAX_ACTIVE_TRADES',
+                'SYMBOL_COOLDOWN', 'MAX_TRADES_PER_SYMBOL'
             ],
             'Martingale Strategy': ['MARTINGALE_MULTIPLIERS'],
             'Allowed Symbols': ['ALLOWED_SYMBOLS'],
